@@ -17,6 +17,15 @@ plugins {
     id "com.github.spotbugs" version "6.4.6"
 }
 
+configurations.all {
+    resolutionStrategy {
+        dependencySubstitution {
+            substitute(module("com.commercetools:commercetools-sync-java"))
+                    .using(module("com.commercetools:commercetools-sync-java:development-SNAPSHOT"))
+        }
+    }
+}
+
 apply from: "$rootDir/gradle-scripts/extensions.gradle"
 apply from: "$rootDir/gradle-scripts/plugins.gradle"
 apply from: "$rootDir/gradle-scripts/project-info.gradle"
@@ -65,7 +74,8 @@ tasks.withType(SpotlessTask) {
 }
 
 dependencies {
-    implementation "com.commercetools:commercetools-sync-java:${commercetoolsSyncJava}"
+    //implementation "com.commercetools:commercetools-sync-java:${commercetoolsSyncJava}"
+    implementation "com.commercetools:commercetools-sync-java:development-SNAPSHOT"
     implementation "com.commercetools.sdk:commercetools-okhttp-client4:${httpClientVersion}"
     implementation "commons-cli:commons-cli:${apacheCliVersion}"
     implementation "ch.qos.logback:logback-classic:${logbackVersion}"
