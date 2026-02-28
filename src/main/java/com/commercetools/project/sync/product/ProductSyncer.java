@@ -16,7 +16,10 @@ import com.commercetools.api.models.product.ProductDraft;
 import com.commercetools.api.models.product.ProductDraftBuilder;
 import com.commercetools.api.models.product.ProductProjection;
 import com.commercetools.api.models.product.ProductProjectionPagedQueryResponse;
+import com.commercetools.api.models.product.ProductSetAttributeAction;
+import com.commercetools.api.models.product.ProductSetAttributeActionBuilder;
 import com.commercetools.api.models.product.ProductUpdateAction;
+import com.commercetools.api.models.product.ProductVariant;
 import com.commercetools.api.models.product.ProductVariantDraft;
 import com.commercetools.api.models.product.ProductVariantDraftBuilder;
 import com.commercetools.api.predicates.query.product.ProductProjectionQueryBuilderDsl;
@@ -32,6 +35,7 @@ import com.commercetools.sync.products.ProductSyncOptions;
 import com.commercetools.sync.products.ProductSyncOptionsBuilder;
 import com.commercetools.sync.products.helpers.ProductSyncStatistics;
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -98,6 +102,7 @@ public final class ProductSyncer
             .cacheSize(1000000)
             .errorCallback(logErrorCallback)
             .warningCallback(logWarningCallback)
+            .beforeUpdateCallback(ProductSyncer::ensureVariantSelectorForSetAttributeActions)
             .build();
 
     final ProductSync productSync = new ProductSync(syncOptions);
@@ -190,6 +195,52 @@ public final class ProductSyncer
     }
 
     return productProjectionsGet;
+  }
+
+  @Nonnull
+  private static List<ProductUpdateAction> ensureVariantSelectorForSetAttributeActions(
+          @Nonnull final List<ProductUpdateAction> updateActions,
+          @Nonnull final ProductDraft newDraft,
+          @Nonnull final ProductProjection oldProduct) {
+
+    final Long masterVariantId = getMasterVariantId(oldProduct);
+
+    final List<ProductUpdateAction> fixed = new ArrayList<>(updateActions.size());
+    for (ProductUpdateAction action : updateActions) {
+      if (action instanceof ProductSetAttributeAction) {
+        final ProductSetAttributeAction setAttr = (ProductSetAttributeAction) action;
+
+        final boolean missingSku = setAttr.getSku() == null || setAttr.getSku().isBlank();
+        final boolean missingVariantId = setAttr.getVariantId() == null;
+
+        if (missingSku && missingVariantId) {
+          // safest fallback: apply to master variant
+          if (masterVariantId != null) {
+            fixed.add(
+                    ProductSetAttributeActionBuilder.of()
+                            .name(setAttr.getName())
+                            .value(setAttr.getValue())
+                            .staged(setAttr.getStaged())
+                            .variantId(masterVariantId)
+                            .build());
+            continue;
+          }
+        }
+      }
+
+      fixed.add(action);
+    }
+    return fixed;
+  }
+
+  @Nullable
+  private static Long getMasterVariantId(@Nonnull final ProductProjection oldProduct) {
+    final ProductVariant master = oldProduct.getMasterVariant();
+    if (master == null) {
+      return 1L;
+    }
+    final Long id = master.getId();
+    return id != null ? id : 1L;
   }
 
   @Nonnull

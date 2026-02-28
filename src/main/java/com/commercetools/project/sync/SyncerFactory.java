@@ -21,6 +21,7 @@ import com.commercetools.project.sync.exception.CliException;
 import com.commercetools.project.sync.inventoryentry.InventoryEntrySyncer;
 import com.commercetools.project.sync.model.ProductSyncCustomRequest;
 import com.commercetools.project.sync.product.ProductSyncer;
+import com.commercetools.project.sync.product.ReferenceAttributeReconciler;
 import com.commercetools.project.sync.producttype.ProductTypeSyncer;
 import com.commercetools.project.sync.shoppinglist.ShoppingListSyncer;
 import com.commercetools.project.sync.state.StateSyncer;
@@ -143,8 +144,24 @@ public final class SyncerFactory {
                   runnerNameOptionValue,
                   isSyncProjectSyncCustomObjects,
                   productSyncCustomRequest);
-      syncersToRunParallel.add(
-          syncer.sync(runnerNameOptionValue, isFullSync).toCompletableFuture());
+
+      final CompletableFuture<Void> syncFuture =
+              syncer.sync(runnerNameOptionValue, isFullSync).toCompletableFuture();
+
+      CompletableFuture<Void> chained = syncFuture;
+
+      // Run Step-2 only after PRODUCT_SYNC finishes
+      if (syncOptionValue == SyncModuleOption.PRODUCT_SYNC) {
+        chained =
+                chained.thenCompose(
+                        ignored ->
+                                new ReferenceAttributeReconciler(
+                                        sourceClientSupplier.get(), targetClientSupplier.get())
+                                        .run()
+                                        .toCompletableFuture());
+      }
+
+      syncersToRunParallel.add(chained);
     }
 
     return CompletableFuture.allOf(syncersToRunParallel.toArray(new CompletableFuture[0]));
