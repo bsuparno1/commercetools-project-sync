@@ -4,15 +4,13 @@ import com.commercetools.api.client.ProjectApiRoot;
 import com.commercetools.api.models.product.Attribute;
 import com.commercetools.api.models.product.Product;
 import com.commercetools.api.models.product.ProductProjection;
+import com.commercetools.api.models.product.ProductPublishActionBuilder;
 import com.commercetools.api.models.product.ProductSetAttributeActionBuilder;
 import com.commercetools.api.models.product.ProductSetProductAttributeActionBuilder;
 import com.commercetools.api.models.product.ProductUpdate;
 import com.commercetools.api.models.product.ProductUpdateAction;
 import com.commercetools.api.models.product.ProductUpdateBuilder;
 import com.commercetools.api.models.product.ProductVariant;
-import com.commercetools.api.models.product.ProductPublishActionBuilder;
-import com.commercetools.api.models.product_type.ProductType;
-import com.commercetools.api.models.product_type.ProductTypePagedQueryResponse;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -20,13 +18,13 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.vrap.rmf.base.client.ApiHttpException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,25 +41,19 @@ import org.slf4j.LoggerFactory;
 public final class ReferenceAttributeReconciler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ReferenceAttributeReconciler.class);
-    private static final int PAGE_SIZE = 200;
+
+    // PERF: fewer requests per rule; if your API max is lower, set back to 200.
+    private static final int PAGE_SIZE = 500;
 
     private final ProjectApiRoot source;
     private final ProjectApiRoot target;
     private final ObjectMapper om = new ObjectMapper();
 
-    // Configure the product types + attributes you want to reconcile.
-    // productTypeKey values must match the ProductType "key" in commercetools.
     private final List<Rule> rules = List.of(
-            // menu_product: variant attribute product_sku
             Rule.variantAttr("menu_product", "product_sku", 1L),
-
-            // menu_sku: product-level attribute sku_configurable_properties
             Rule.productAttr("menu_sku", "sku_configurable_properties"),
-
-            // configurable-properties: product-level attribute configurationOptions
             Rule.productAttr("configurable-properties", "configurationOptions"),
             Rule.productAttr("configurable-properties", "defaultSelectedConfigurationOption"),
-
             Rule.productAttr("configurable-option", "productRef"),
             Rule.productAttr("configurable-option", "dineInSku")
     );
@@ -78,44 +70,9 @@ public final class ReferenceAttributeReconciler {
 
     @Nonnull
     public CompletionStage<Void> run() {
-        return loadProductTypeIds()
+        return loadProductTypeIdsViaGraphQl()
                 .thenCompose(ignored -> reconcileAllRules())
                 .thenAccept(ignored -> {});
-    }
-
-    @Nonnull
-    private CompletionStage<Void> loadProductTypeIds() {
-        // Fetch ProductType ids by key for all configured rules.
-        final Set<String> keys = new HashSet<>();
-        for (Rule r : rules) keys.add(r.productTypeKey);
-
-        return target.productTypes().get().withLimit(PAGE_SIZE).withWithTotal(true).execute()
-                .thenCompose(resp -> {
-                    ProductTypePagedQueryResponse body = resp.getBody();
-                    if (body == null) return CompletableFuture.completedFuture(null);
-
-                    long total = body.getTotal() == null ? 0 : body.getTotal();
-                    long pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
-
-                    CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
-                    for (int p = 0; p < pages; p++) {
-                        int offset = p * PAGE_SIZE;
-                        chain = chain.thenCompose(ignored -> target.productTypes().get()
-                                .withLimit(PAGE_SIZE)
-                                .withOffset(offset)
-                                .execute()
-                                .thenAccept(r -> {
-                                    List<ProductType> pts = r.getBody().getResults();
-                                    if (pts == null) return;
-                                    for (ProductType pt : pts) {
-                                        if (pt.getKey() != null && pt.getId() != null && keys.contains(pt.getKey())) {
-                                            productTypeKeyToId.put(pt.getKey(), pt.getId());
-                                        }
-                                    }
-                                }).toCompletableFuture());
-                    }
-                    return chain;
-                });
     }
 
     @Nonnull
@@ -129,46 +86,31 @@ public final class ReferenceAttributeReconciler {
 
     @Nonnull
     private CompletionStage<Void> reconcileRule(@Nonnull final Rule rule) {
+        LOGGER.info("Step-2: Reconciling rule {}", rule);
+
         final String ptId = productTypeKeyToId.get(rule.productTypeKey);
-        if (ptId == null) {
-            LOGGER.warn("Step-2: ProductType key '{}' not found in TARGET. Skipping rule {}.", rule.productTypeKey, rule);
+        if (ptId == null || ptId.isBlank()) {
+            LOGGER.warn("Step-2: ProductType key '{}' not found in TARGET. Skipping rule {}.",
+                    rule.productTypeKey, rule);
             return CompletableFuture.completedFuture(null);
         }
 
-        LOGGER.info("Step-2: Reconciling rule {}", rule);
-        return reconcileTargetProductsOfType(ptId, 0, rule);
-    }
-
-    @Nonnull
-    private CompletionStage<Void> reconcileTargetProductsOfType(
-            @Nonnull final String productTypeId, final int offset, @Nonnull final Rule rule) {
-
-        return target.productProjections().get()
-                .withStaged(true)
-                .withWhere("productType(id = :ptId)")
-                .withPredicateVar("ptId", productTypeId)
-                .withLimit(PAGE_SIZE)
-                .withOffset(offset)
-                .execute()
-                .thenCompose(resp -> {
-                    List<ProductProjection> results = resp.getBody().getResults();
-                    if (results == null || results.isEmpty()) {
-                        return CompletableFuture.completedFuture(null);
-                    }
-
-                    CompletableFuture<Void> pageChain = CompletableFuture.completedFuture(null);
-                    for (ProductProjection tp : results) {
-                        pageChain = pageChain.thenCompose(ignored -> reconcileOneTargetProduct(tp, rule).toCompletableFuture());
-                    }
-
-                    return pageChain.thenCompose(ignored -> reconcileTargetProductsOfType(productTypeId, offset + PAGE_SIZE, rule).toCompletableFuture());
-                });
+        return reconcileTargetProductsOfTypeId(ptId, null, rule);
     }
 
     @Nonnull
     private CompletionStage<Void> reconcileOneTargetProduct(@Nonnull final ProductProjection targetProjection, @Nonnull final Rule rule) {
         final String productKey = targetProjection.getKey();
         if (productKey == null || productKey.isBlank()) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        // PERF: if target already has a resolved value, skip BEFORE fetching SOURCE.
+        final Attribute targetAttr = rule.isVariant
+                ? findVariantAttr(targetProjection.getMasterVariant(), rule.attributeName)
+                : findProductAttr(targetProjection.getAttributes(), rule.attributeName);
+
+        if (targetAttr != null && !attributeNeedsFix(targetAttr)) {
             return CompletableFuture.completedFuture(null);
         }
 
@@ -183,32 +125,11 @@ public final class ReferenceAttributeReconciler {
                             : findProductAttr(src.getAttributes(), rule.attributeName);
 
                     if (srcAttr == null) {
-                        // Source doesn't have it => nothing to enforce.
                         return CompletableFuture.completedFuture(null);
                     }
 
-                    // Resolve references inside srcAttr value from SOURCE -> TARGET
                     Object rewrittenValue = rewriteReferencesToTargetIds(srcAttr.getValue());
                     if (rewrittenValue == null) {
-                        return CompletableFuture.completedFuture(null);
-                    }
-
-                    // If target already has a non-empty attribute, skip (safe-by-default).
-                    /*boolean alreadySet = rule.isVariant
-                            ? (findVariantAttr(targetProjection.getMasterVariant(), rule.attributeName) != null)
-                            : (findProductAttr(targetProjection.getAttributes(), rule.attributeName) != null);
-
-                    if (alreadySet) {
-                        return CompletableFuture.completedFuture(null);
-                    }*/
-
-                    // target attribute
-                    final Attribute targetAttr = rule.isVariant
-                            ? findVariantAttr(targetProjection.getMasterVariant(), rule.attributeName)
-                            : findProductAttr(targetProjection.getAttributes(), rule.attributeName);
-
-                    // Only skip if target is already "resolved"
-                    if (targetAttr != null && !attributeNeedsFix(targetAttr)) {
                         return CompletableFuture.completedFuture(null);
                     }
 
@@ -216,7 +137,6 @@ public final class ReferenceAttributeReconciler {
                     return applyAttributeToTargetProduct(targetProjection.getId(), productKey, rule, rewrittenValue);
                 })
                 .exceptionallyCompose(ex -> {
-                    // If source product doesn't exist, ignore.
                     if (ex instanceof ApiHttpException && ((ApiHttpException) ex).getStatusCode() == 404) {
                         return CompletableFuture.completedFuture(null);
                     }
@@ -248,7 +168,8 @@ public final class ReferenceAttributeReconciler {
             @Nonnull final Rule rule,
             @Nonnull final Object value) {
 
-        return target.products().withKey(targetProductKey).get().execute()
+        // PERF+SAFETY: fetch by ID (we already have it), not by key.
+        return target.products().withId(targetProductId).get().execute()
                 .thenCompose(getResp -> {
                     Product p = getResp.getBody();
                     if (p == null) return CompletableFuture.completedFuture(null);
@@ -288,11 +209,6 @@ public final class ReferenceAttributeReconciler {
                 .thenAccept(ignored -> {});
     }
 
-    /**
-     * Rewrites any embedded product references:
-     * - if reference.id looks like a SOURCE UUID => fetch SOURCE product by id and get its key
-     * - then fetch TARGET product by key and use its id
-     */
     private Object rewriteReferencesToTargetIds(Object srcValue) {
         JsonNode node = om.valueToTree(srcValue);
         JsonNode rewritten = rewriteNode(node);
@@ -331,12 +247,10 @@ public final class ReferenceAttributeReconciler {
     }
 
     private String resolveTargetIdFromSourceIdOrKey(String sourceIdOrKey) {
-        // If already cached as target key -> id
         if (targetKeyToId.containsKey(sourceIdOrKey)) {
             return targetKeyToId.get(sourceIdOrKey);
         }
 
-        // First, interpret as SOURCE product id -> key (if it is a UUID)
         String sourceKey = sourceIdOrKey;
         if (looksLikeUuid(sourceIdOrKey)) {
             sourceKey = sourceIdToKey.computeIfAbsent(sourceIdOrKey, this::fetchSourceProductKeyById);
@@ -345,7 +259,6 @@ public final class ReferenceAttributeReconciler {
             }
         }
 
-        // Then resolve TARGET product id by key
         String targetId = fetchTargetProductIdByKey(sourceKey);
         if (targetId != null) {
             targetKeyToId.put(sourceKey, targetId);
@@ -410,13 +323,9 @@ public final class ReferenceAttributeReconciler {
         if (node == null || node.isNull()) {
             return true;
         }
-
-        // empty array/set => needs fix
         if (node.isArray() && node.size() == 0) {
             return true;
         }
-
-        // If it contains any product reference whose id is a UUID (likely source id) => needs fix
         return containsUuidProductReference(node);
     }
 
@@ -442,5 +351,124 @@ public final class ReferenceAttributeReconciler {
         }
 
         return false;
+    }
+
+    /*@Nonnull
+    private CompletionStage<Void> reconcileTargetProductsOfTypeId(
+            @Nonnull final String productTypeId, final int offset, @Nonnull final Rule rule) {
+
+        return target.productProjections().get()
+                .withStaged(true)
+                .withWhere("productType(id = :ptId)")
+                .withPredicateVar("ptId", productTypeId)
+                .withLimit(PAGE_SIZE)
+                .withOffset(offset)
+                .execute()
+                .thenCompose(resp -> {
+                    List<ProductProjection> results = resp.getBody().getResults();
+                    if (results == null || results.isEmpty()) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+
+                    CompletableFuture<Void> pageChain = CompletableFuture.completedFuture(null);
+                    for (ProductProjection tp : results) {
+                        pageChain = pageChain.thenCompose(
+                                ignored -> reconcileOneTargetProduct(tp, rule).toCompletableFuture());
+                    }
+
+                    return pageChain.thenCompose(
+                            ignored -> reconcileTargetProductsOfTypeId(productTypeId, offset + PAGE_SIZE, rule)
+                                    .toCompletableFuture());
+                });
+    }*/
+
+    @Nonnull
+    private CompletionStage<Void> reconcileTargetProductsOfTypeId(
+            @Nonnull final String productTypeId,
+            @Nullable final String lastId,
+            @Nonnull final Rule rule) {
+
+        // Cursor paging (no offset) to avoid offset > 10000 error.
+        // Sort by id asc; then fetch next page with where id > :lastId.
+        var req =
+                target.productProjections()
+                        .get()
+                        .withStaged(true)
+                        .withSort("id asc")
+                        .withLimit(PAGE_SIZE);
+
+        if (lastId == null) {
+            req =
+                    req.withWhere("productType(id = :ptId)")
+                            .withPredicateVar("ptId", productTypeId);
+        } else {
+            req =
+                    req.withWhere("productType(id = :ptId) and id > :lastId")
+                            .withPredicateVar("ptId", productTypeId)
+                            .withPredicateVar("lastId", lastId);
+        }
+
+        return req.execute()
+                .thenCompose(
+                        resp -> {
+                            final List<ProductProjection> results = resp.getBody().getResults();
+                            if (results == null || results.isEmpty()) {
+                                return CompletableFuture.completedFuture(null);
+                            }
+
+                            CompletableFuture<Void> pageChain = CompletableFuture.completedFuture(null);
+                            for (ProductProjection tp : results) {
+                                pageChain =
+                                        pageChain.thenCompose(
+                                                ignored -> reconcileOneTargetProduct(tp, rule).toCompletableFuture());
+                            }
+
+                            // Continue from the last element's id
+                            final String nextLastId = results.get(results.size() - 1).getId();
+                            return pageChain.thenCompose(
+                                    ignored -> reconcileTargetProductsOfTypeId(productTypeId, nextLastId, rule).toCompletableFuture());
+                        });
+    }
+
+
+    @Nonnull
+    private CompletionStage<Void> loadProductTypeIdsViaGraphQl() {
+        final List<String> keys =
+                rules.stream().map(r -> r.productTypeKey).distinct().collect(java.util.stream.Collectors.toList());
+
+        if (keys.isEmpty()) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        final String where =
+                keys.stream()
+                        .map(k -> "key=\\\"" + k.replace("\"", "\\\\\"") + "\\\"")
+                        .collect(java.util.stream.Collectors.joining(" OR "));
+
+        final String query =
+                "query { productTypes(where: \"" + where + "\", limit: " + keys.size() + ") { results { id key } } }";
+
+        final com.commercetools.api.models.graph_ql.GraphQLRequest req =
+                com.commercetools.api.models.graph_ql.GraphQLRequestBuilder.of().query(query).build();
+
+        return target.graphql().post(req).execute().thenAccept(resp -> {
+            final ObjectMapper mapper = new ObjectMapper();
+            final JsonNode root = mapper.valueToTree(resp.getBody());
+            final JsonNode results =
+                    root.path("data").path("productTypes").path("results");
+
+            if (!results.isArray()) {
+                LOGGER.warn("Step-2: GraphQL productTypes results missing/invalid.");
+                return;
+            }
+
+            for (JsonNode n : results) {
+                final String id = n.path("id").asText(null);
+                final String key = n.path("key").asText(null);
+                if (id != null && key != null) {
+                    productTypeKeyToId.put(key, id);
+                }
+            }
+        });
     }
 }

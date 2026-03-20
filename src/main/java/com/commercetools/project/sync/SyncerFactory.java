@@ -154,11 +154,18 @@ public final class SyncerFactory {
       if (syncOptionValue == SyncModuleOption.PRODUCT_SYNC) {
         chained =
                 chained.thenCompose(
-                        ignored ->
-                                new ReferenceAttributeReconciler(
-                                        sourceClientSupplier.get(), targetClientSupplier.get())
-                                        .run()
-                                        .toCompletableFuture());
+                        ignored -> {
+                          final long step2StartMs = System.currentTimeMillis();
+                          System.out.println("[Step-2] ReferenceAttributeReconciler START");
+
+                          return new ReferenceAttributeReconciler(
+                                  sourceClientSupplier.get(), targetClientSupplier.get())
+                                  .run()
+                                  .whenComplete((ok, ex) ->
+                                          System.out.println("[Step-2] ReferenceAttributeReconciler END in "
+                                                  + (System.currentTimeMillis() - step2StartMs) + " ms"))
+                                  .toCompletableFuture();
+                        });
       }
 
       syncersToRunParallel.add(chained);
